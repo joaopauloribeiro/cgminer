@@ -33,7 +33,6 @@
 # include <netinet/tcp.h>
 # include <netdb.h>
 #else
-# include <windows.h>
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <mmsystem.h>
@@ -294,6 +293,59 @@ static int curl_debug_cb(__maybe_unused CURL *handle, curl_infotype type,
 			break;
 	}
 	return 0;
+}
+
+json_t *json_web_config(const char *url)
+{
+	struct data_buffer all_data = {NULL, 0};
+	char curl_err_str[CURL_ERROR_SIZE];
+	long timeout = 60;
+	json_error_t err;
+	json_t *val;
+	CURL *curl;
+	int rc;
+
+	memset(&err, 0, sizeof(err));
+
+	curl = curl_easy_init();
+	if (unlikely(!curl))
+		quithere(1, "CURL initialisation failed");
+
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_ENCODING, "");
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
+
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+	curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_TRY);
+
+	val = NULL;
+	rc = curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+	if (rc) {
+		applog(LOG_ERR, "HTTP config request of '%s' failed: %s", url, curl_err_str);
+		goto c_out;
+	}
+
+	if (!all_data.buf) {
+		applog(LOG_ERR, "Empty config data received from '%s'", url);
+		goto c_out;
+	}
+
+	val = JSON_LOADS(all_data.buf, &err);
+	if (!val) {
+		applog(LOG_ERR, "JSON config decode of '%s' failed(%d): %s", url,
+		       err.line, err.text);
+	}
+	databuf_free(&all_data);
+
+c_out:
+	return val;
 }
 
 json_t *json_rpc_call(CURL *curl, const char *url,
@@ -719,10 +771,10 @@ void address_to_pubkeyhash(unsigned char *pkh, const char *addr)
 	pkh[24] = 0xac;
 }
 
-/*  For encoding nHeight into coinbase, pad out to 9 bytes */
-void ser_number(unsigned char *s, int64_t val)
+/*  For encoding nHeight into coinbase, return how many bytes were used */
+int ser_number(unsigned char *s, int32_t val)
 {
-	int64_t *i64 = (int64_t *)&s[1];
+	int32_t *i32 = (int32_t *)&s[1];
 	int len;
 
 	if (val < 128)
@@ -733,9 +785,9 @@ void ser_number(unsigned char *s, int64_t val)
 		len = 3;
 	else
 		len = 4;
-	*i64 = htole64(val);
+	*i32 = htole32(val);
 	s[0] = len++;
-	s[len] = 9 - len;
+	return len;
 }
 
 /* For encoding variable length strings */
@@ -1471,6 +1523,18 @@ static void clear_sock(struct pool *pool)
 	clear_sockbuf(pool);
 }
 
+/* Realloc memory to new size and zero any extra memory added */
+void _recalloc(void **ptr, size_t old, size_t new, const char *file, const char *func, const int line)
+{
+	if (new == old)
+		return;
+	*ptr = realloc(*ptr, new);
+	if (unlikely(!*ptr))
+		quitfrom(1, file, func, line, "Failed to realloc");
+	if (new > old)
+		memset(*ptr + old, 0, new - old);
+}
+
 /* Make sure the pool sockbuf is large enough to cope with any coinbase size
  * by reallocing it to a large enough size rounded up to a multiple of RBUFSIZE
  * and zeroing the new memory */
@@ -1791,6 +1855,26 @@ static bool parse_reconnect(struct pool *pool, json_t *val)
 	url = (char *)json_string_value(json_array_get(val, 0));
 	if (!url)
 		url = pool->sockaddr_url;
+	else {
+		char *dot_pool, *dot_reconnect;
+		dot_pool = strchr(pool->sockaddr_url, '.');
+		if (!dot_pool) {
+			applog(LOG_ERR, "Denied stratum reconnect request for pool without domain '%s'",
+			       pool->sockaddr_url);
+			return false;
+		}
+		dot_reconnect = strchr(url, '.');
+		if (!dot_reconnect) {
+			applog(LOG_ERR, "Denied stratum reconnect request to url without domain '%s'",
+			       url);
+			return false;
+		}
+		if (strcmp(dot_pool, dot_reconnect)) {
+			applog(LOG_ERR, "Denied stratum reconnect request to non-matching domain url '%s'",
+				pool->sockaddr_url);
+			return false;
+		}
+	}
 
 	port = (char *)json_string_value(json_array_get(val, 1));
 	if (!port)
@@ -1801,7 +1885,7 @@ static bool parse_reconnect(struct pool *pool, json_t *val)
 	if (!extract_sockaddr(address, &sockaddr_url, &stratum_port))
 		return false;
 
-	applog(LOG_NOTICE, "Reconnect requested from pool %d to %s", pool->pool_no, address);
+	applog(LOG_WARNING, "Stratum reconnect requested from pool %d to %s", pool->pool_no, address);
 
 	clear_pool_work(pool);
 
@@ -1816,8 +1900,10 @@ static bool parse_reconnect(struct pool *pool, json_t *val)
 	free(tmp);
 	mutex_unlock(&pool->stratum_lock);
 
-	if (!restart_stratum(pool))
+	if (!restart_stratum(pool)) {
+		pool_failed(pool);
 		return false;
+	}
 
 	return true;
 }
@@ -1960,6 +2046,8 @@ bool auth_stratum(struct pool *pool)
 			ss = strdup("(unknown reason)");
 		applog(LOG_INFO, "pool %d JSON stratum auth failed: %s", pool->pool_no, ss);
 		free(ss);
+
+		suspend_stratum(pool);
 
 		goto out;
 	}

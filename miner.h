@@ -248,7 +248,8 @@ static inline int fsync (int fd)
 	DRIVER_ADD_COMMAND(minion) \
 	DRIVER_ADD_COMMAND(ants1) \
 	DRIVER_ADD_COMMAND(avalon2) \
-	DRIVER_ADD_COMMAND(avalon)
+	DRIVER_ADD_COMMAND(avalon) \
+	DRIVER_ADD_COMMAND(spondoolies)
 
 #define DRIVER_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
 	FPGA_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
@@ -350,7 +351,6 @@ struct device_drv {
 
 	/* Highest target diff the device supports */
 	double max_diff;
-	double working_diff;
 };
 
 extern struct device_drv *copy_drv(struct device_drv*);
@@ -428,6 +428,7 @@ struct cgpu_info {
 	char *name;
 	char *device_path;
 	void *device_data;
+	char *unique_id;
 #ifdef USE_USBUTILS
 	struct cg_usb_device *usbdev;
 	struct cg_usb_info usbinfo;
@@ -463,6 +464,9 @@ struct cgpu_info {
 	int rejected;
 	int hw_errors;
 	double rolling;
+	double rolling1;
+	double rolling5;
+	double rolling15;
 	double total_mhashes;
 	double utility;
 	enum alive status;
@@ -481,7 +485,7 @@ struct cgpu_info {
 	double temp;
 	int cutofftemp;
 
-	int diff1;
+	int64_t diff1;
 	double diff_accepted;
 	double diff_rejected;
 	int last_share_pool;
@@ -513,6 +517,11 @@ struct cgpu_info {
 	bool shutdown;
 
 	struct timeval dev_start_tv;
+
+	/* For benchmarking only */
+	int hidiff;
+	int lodiff;
+	int direction;
 };
 
 extern bool add_cgpu(struct cgpu_info*);
@@ -541,7 +550,6 @@ struct thr_info {
 
 	bool	pause;
 	bool	getwork;
-	double	rolling;
 
 	bool	work_restart;
 	bool	work_update;
@@ -744,6 +752,7 @@ extern void api_initlock(void *lock, enum cglock_typ typ, const char *file, cons
 #define cglock_init(_lock) _cglock_init(_lock, __FILE__, __func__, __LINE__)
 #define cg_rlock(_lock) _cg_rlock(_lock, __FILE__, __func__, __LINE__)
 #define cg_ilock(_lock) _cg_ilock(_lock, __FILE__, __func__, __LINE__)
+#define cg_uilock(_lock) _cg_uilock(_lock, __FILE__, __func__, __LINE__)
 #define cg_ulock(_lock) _cg_ulock(_lock, __FILE__, __func__, __LINE__)
 #define cg_wlock(_lock) _cg_wlock(_lock, __FILE__, __func__, __LINE__)
 #define cg_dwlock(_lock) _cg_dwlock(_lock, __FILE__, __func__, __LINE__)
@@ -888,6 +897,12 @@ static inline void _cg_ilock(cglock_t *lock, const char *file, const char *func,
 	_mutex_lock(&lock->mutex, file, func, line);
 }
 
+/* Unlock intermediate variant without changing to read or write version */
+static inline void _cg_uilock(cglock_t *lock, const char *file, const char *func, const int line)
+{
+	_mutex_unlock(&lock->mutex, file, func, line);
+}
+
 /* Upgrade intermediate variant to a write lock */
 static inline void _cg_ulock(cglock_t *lock, const char *file, const char *func, const int line)
 {
@@ -998,6 +1013,9 @@ extern char *opt_bitmine_a1_options;
 extern char *opt_bitmain_options;
 extern bool opt_bitmain_hwerror;
 #endif
+#ifdef USE_MINION
+extern char *opt_minion_freq;
+#endif
 #ifdef USE_USBUTILS
 extern char *opt_usb_select;
 extern int opt_usbdump;
@@ -1017,6 +1035,7 @@ extern pthread_rwlock_t netacc_lock;
 
 extern const uint32_t sha256_init_state[];
 #ifdef HAVE_LIBCURL
+extern json_t *json_web_config(const char *url);
 extern json_t *json_rpc_call(CURL *curl, const char *url, const char *userpass,
 			     const char *rpc_req, bool, bool, int *,
 			     struct pool *pool, bool);
@@ -1093,12 +1112,13 @@ extern struct pool **pools;
 extern struct strategies strategies[];
 extern enum pool_strategy pool_strategy;
 extern int opt_rotate_period;
+extern double rolling1, rolling5, rolling15;
 extern double total_rolling;
 extern double total_mhashes_done;
 extern unsigned int new_blocks;
 extern unsigned int found_blocks;
-extern int total_accepted, total_rejected, total_diff1;;
-extern int total_getworks, total_stale, total_discarded;
+extern int64_t total_accepted, total_rejected, total_diff1;
+extern int64_t total_getworks, total_stale, total_discarded;
 extern double total_diff_accepted, total_diff_rejected, total_diff_stale;
 extern unsigned int local_work;
 extern unsigned int total_go, total_ro;
@@ -1139,11 +1159,11 @@ struct stratum_work {
 struct pool {
 	int pool_no;
 	int prio;
-	int accepted, rejected;
+	int64_t accepted, rejected;
 	int seq_rejects;
 	int seq_getfails;
 	int solved;
-	int diff1;
+	int64_t diff1;
 	char diff[8];
 	int quota;
 	int quota_gcd;
@@ -1220,7 +1240,6 @@ struct pool {
 
 	char *nonce1;
 	unsigned char *nonce1bin;
-	size_t n1_len;
 	uint64_t nonce2;
 	int n2size;
 	char *sessionid;
@@ -1255,11 +1274,14 @@ struct pool {
 	unsigned char merklebin[16 * 32];
 	int transactions;
 	char *txn_data;
-	unsigned char scriptsig_base[42 + 2];
+	unsigned char scriptsig_base[100];
 	unsigned char script_pubkey[25 + 3];
 	int nValue;
+	CURL *gbt_curl;
+	bool gbt_curl_inuse;
 
 	/* Shared by both stratum & GBT */
+	size_t n1_len;
 	unsigned char *coinbase;
 	int coinbase_len;
 	int nonce2_offset;
@@ -1288,7 +1310,8 @@ struct work {
 	unsigned char	target[32];
 	unsigned char	hash[32];
 
-	unsigned char	device_target[32];
+	/* This is the diff the device is currently aiming for and must be
+	 * the minimum of work_difficulty & drv->max_diff */
 	double		device_diff;
 	uint64_t	share_diff;
 
@@ -1326,6 +1349,8 @@ struct work {
 	uint32_t	id;
 	UT_hash_handle	hh;
 
+	/* This is the diff work we're aiming to submit and should match the
+	 * work->target binary */
 	double		work_difficulty;
 
 	// Allow devices to identify work if multiple sub-devices
@@ -1415,7 +1440,11 @@ extern int curses_int(const char *query);
 extern char *curses_input(const char *query);
 extern void kill_work(void);
 extern void switch_pools(struct pool *selected);
-extern void discard_work(struct work *work);
+extern void _discard_work(struct work *work);
+#define discard_work(WORK) do { \
+	_discard_work(WORK); \
+	WORK = NULL; \
+} while (0)
 extern void remove_pool(struct pool *pool);
 extern void write_config(FILE *fcfg);
 extern void zero_bestshare(void);
@@ -1425,6 +1454,7 @@ extern bool log_curses_only(int prio, const char *datetime, const char *str);
 extern void clear_logwin(void);
 extern void logwin_update(void);
 extern bool pool_tclear(struct pool *pool, bool *var);
+extern void pool_failed(struct pool *pool);
 extern struct thread_q *tq_new(void);
 extern void tq_free(struct thread_q *tq);
 extern bool tq_push(struct thread_q *tq, void *data);
@@ -1437,7 +1467,11 @@ extern void app_restart(void);
 extern void roll_work(struct work *work);
 extern struct work *make_clone(struct work *work);
 extern void clean_work(struct work *work);
-extern void free_work(struct work *work);
+extern void _free_work(struct work *work);
+#define free_work(WORK) do { \
+	_free_work(WORK); \
+	WORK = NULL; \
+} while (0)
 extern void set_work_ntime(struct work *work, int ntime);
 extern struct work *copy_work_noffset(struct work *base_work, int noffset);
 #define copy_work(work_in) copy_work_noffset(work_in, 0)
@@ -1457,6 +1491,7 @@ enum api_data_type {
 	API_UINT32,
 	API_HEX32,
 	API_UINT64,
+	API_INT64,
 	API_DOUBLE,
 	API_ELAPSED,
 	API_BOOL,

@@ -519,7 +519,8 @@ static void cta_parse_statset(struct cointerra_info *info, char *buf)
 	mutex_unlock(&info->lock);
 }
 
-static void cta_parse_info(struct cointerra_info *info, char *buf)
+static void cta_parse_info(struct cgpu_info *cointerra, struct cointerra_info *info,
+			   char *buf)
 {
 	mutex_lock(&info->lock);
 	info->hwrev = hu64_from_msg(buf, CTA_INFO_HWREV);
@@ -538,6 +539,12 @@ static void cta_parse_info(struct cointerra_info *info, char *buf)
 	info->min_diffbits = u8_from_msg(buf, CTA_INFO_MINDIFFBITS);
 	info->max_diffbits = u8_from_msg(buf, CTA_INFO_MAXDIFFBITS);
 	mutex_unlock(&info->lock);
+
+	if (!cointerra->unique_id) {
+		uint32_t b32 = htobe32(info->serial);
+
+		cointerra->unique_id = bin2hex((unsigned char *)&b32, 4);
+	}
 }
 
 static void cta_parse_rdone(struct cgpu_info *cointerra, struct cointerra_info *info,
@@ -649,7 +656,7 @@ static void cta_parse_msg(struct thr_info *thr, struct cgpu_info *cointerra,
 		case CTA_RECV_INFO:
 			applog(LOG_DEBUG, "%s %d: Info message received",
 			       cointerra->drv->name, cointerra->device_id);
-			cta_parse_info(info, buf);
+			cta_parse_info(cointerra, info, buf);
 			break;
 		case CTA_RECV_MSG:
 			applog(LOG_NOTICE, "%s %d: MSG: %s",
@@ -896,7 +903,7 @@ resend:
 	if (reset_type == CTA_RESET_NEW) {
 		ret = cgsem_mswait(&info->reset_sem, CTA_RESET_TIMEOUT);
 		if (ret) {
-			if (++retries < 3) {
+			if (++retries < 5) {
 				applog(LOG_INFO, "%s %d: Timed out waiting for reset done msg, retrying",
 				       cointerra->drv->name, cointerra->device_id);
 				goto resend;
@@ -1227,7 +1234,7 @@ static void cta_statline_before(char *buf, size_t bufsiz, struct cgpu_info *coin
 	}
 	max_volt /= 1000;
 
-	tailsprintf(buf, bufsiz, "%4dMHz %3.1fC %3.2fV", freq, cointerra->temp, max_volt);
+	tailsprintf(buf, bufsiz, "%3dMHz %3.1fC %3.2fV", freq, cointerra->temp, max_volt);
 }
 
 struct device_drv cointerra_drv = {

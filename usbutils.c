@@ -159,13 +159,13 @@ static struct usb_intinfo bxf_ints[] = {
 	USB_EPS(0,  bxf0_epinfos)
 };
 
-static struct usb_epinfo nf1_epinfos[] = {
+static struct usb_epinfo nfu_epinfos[] = {
 	{ LIBUSB_TRANSFER_TYPE_INTERRUPT,	64,	EPI(1), 0, 0 },
 	{ LIBUSB_TRANSFER_TYPE_INTERRUPT,	64,	EPO(1), 0, 0 },
 };
 
-static struct usb_intinfo nf1_ints[] = {
-	USB_EPS(0, nf1_epinfos)
+static struct usb_intinfo nfu_ints[] = {
+	USB_EPS(0, nfu_epinfos)
 };
 
 static struct usb_epinfo bxm_epinfos[] = {
@@ -415,14 +415,27 @@ static struct usb_find_devices find_dev[] = {
 	},
 	{
 		.drv = DRIVER_bitfury,
-		.name = "NF1",
-		.ident = IDENT_NF1,
+		.name = "OSM",
+		.ident = IDENT_OSM,
+		.idVendor = 0x198c,
+		.idProduct = 0xb1f1,
+		.config = 1,
+		.timeout = BITFURY_TIMEOUT_MS,
+		.latency = LATENCY_UNUSED,
+		.iManufacturer = "c-scape",
+		.iProduct = "OneString",
+		INTINFO(bxf_ints)
+	},
+	{
+		.drv = DRIVER_bitfury,
+		.name = "NFU",
+		.ident = IDENT_NFU,
 		.idVendor = 0x04d8,
 		.idProduct = 0x00de,
 		.config = 1,
 		.timeout = BITFURY_TIMEOUT_MS,
 		.latency = LATENCY_UNUSED,
-		INTINFO(nf1_ints)
+		INTINFO(nfu_ints)
 	},
 	{
 		.drv = DRIVER_bitfury,
@@ -1904,10 +1917,9 @@ static int _usb_init(struct cgpu_info *cgpu, struct libusb_device *dev, struct u
 #ifdef WIN32
 			// Windows specific message
 			case LIBUSB_ERROR_NOT_SUPPORTED:
-				applog(LOG_ERR,
-					"USB init, open device failed, err %d, "
-					"you need to install a WinUSB driver for %s",
-					err, devstr);
+				applog(LOG_ERR, "USB init, open device failed, err %d, ", err);
+				applog(LOG_ERR, "You need to install a WinUSB driver for %s", devstr);
+				applog(LOG_ERR, "And associate %s with WinUSB using zadig", devstr);
 				applog(LOG_ERR, "See README.txt file included for help");
 				break;
 #endif
